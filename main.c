@@ -5,14 +5,24 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
+#include <semaphore.h>
+
 
 #define PORT 7379
+
+sem_t semaphores;
+
+struct Argouments{
+    int client_sockfd;
+    struct LinkedList* list;
+};
 
 struct Node {
     char* key;
     char* value;
-    //int enter_time;
-    //int total_time;
+    int enter_time;
+    int total_time;
     struct Node* next;
 };
 
@@ -51,12 +61,12 @@ void removeElement(struct LinkedList* list, char* key) {
     free(current);
 }
 
-void add(struct LinkedList* list, char* key, char *value) {
+void add(struct LinkedList* list, char* key, char *value, int enter_time, int total_time) {
     struct Node* newNode = (struct Node*)malloc(sizeof(struct Node));
     newNode->key = key;
     newNode->value = value;
-    //newNode->enter_time = enter_time;
-    //newNode->total_time = total_time;
+    newNode->enter_time = enter_time;
+    newNode->total_time = total_time;
     newNode->next = NULL;
 
     if (list->head == NULL) {
@@ -84,7 +94,7 @@ void freeLinkedList(struct LinkedList* list) {
 void print(struct LinkedList* list) {
     struct Node* current = list->head;
     while (current != NULL) {
-        printf("Key: %s, Value: %s\n", current->key, current->value);
+        printf("Key: %s, Value: %s, Enter time: %d, total time: %d\n ", current->key, current->value, current->enter_time, current->total_time);
         current = current->next;
     }
 }
@@ -107,7 +117,7 @@ void exit_with_error(const char * msg) {
 }
 
 
-void reading_from_socket(int client_sockfd, struct LinkedList* list){
+void reading_from_socket(struct Argouments* t){
     char buf[1024];
     
 
@@ -117,8 +127,7 @@ void reading_from_socket(int client_sockfd, struct LinkedList* list){
         memset(buf, '\0', sizeof(buf));
 
         //receive message
-        int bytes_read = recv(client_sockfd, buf, sizeof(buf), 0);  
-        printf("Ho ricevuto il messaggio: %s\n", buf);
+        int bytes_read = recv(t->client_sockfd, buf, sizeof(buf), 0);  
         if(bytes_read == 0) break;
 
 
@@ -136,7 +145,7 @@ void reading_from_socket(int client_sockfd, struct LinkedList* list){
                 int enter_time = -1;
                 int total_time = -1;
 
-                for (int i = 0; i<4;i++){
+                for (int i = 0; i<8;i++){
                     command = strtok(NULL,"\r\n");
                     if(command == NULL) break;
 
@@ -146,23 +155,29 @@ void reading_from_socket(int client_sockfd, struct LinkedList* list){
                     else if (i == 3){
                         strcpy(value, command);
                     }
-                    /*else if(i == 7){
+                    else if(i == 7){
                         total_time = atoi(command);
                         enter_time = time(NULL);
-                    }*/
+                    }
                     
                 }
 
-                add(list,key,value);
-                print(list);
+                
+                /*CS*/
+                if(sem_wait(&semaphores)==-1)exit_with_error("error in sem_wait during set"); 
+                add(t->list, key, value, enter_time, total_time);
+                if(sem_post(&semaphores)==-1)exit_with_error("error in sem_post during set"); 
+                /*end CS*/
 
 
-                int bytes_written = write(client_sockfd, "+OK\r\n", strlen("+OK\r\n"));
+                int bytes_written = write(t->client_sockfd, "+OK\r\n", strlen("+OK\r\n"));
                 if (bytes_written == -1) {
                     exit_with_error("Error writing to client");
                 }
                 
             }
+
+            if(command == NULL) break;
 
             // GET
             if(strcmp(command, "GET") == 0){
@@ -175,37 +190,50 @@ void reading_from_socket(int client_sockfd, struct LinkedList* list){
                     }
                 }
 
-                printf ("PRINTO LA LINKED LIST: \n");
-                print(list);
-                printf ("FINE\n");
+                if(sem_wait(&semaphores)==-1)exit_with_error("error in sem_wait during set"); 
 
-                struct Node* n = search(list, key);
+
+                struct Node* n = search(t->list, key);
+
                 if(n == NULL){
-                    int bytes_written = write(client_sockfd, "$-1\r\n", strlen("$-1\r\n"));
+                    int bytes_written = write(t->client_sockfd, "$-1\r\n", strlen("$-1\r\n"));
                     if (bytes_written == -1) {
                         exit_with_error("Error writing to client");
                     }
                     
-                    printf("NON C'é\n");
                 }
                 else{
-                    
-                    printf ("IL GET HA DATO: key: %s, value: %s\n", n->key, n->value);
-                    printf("CONTROLLO SE VA TOLTO\n");
+
                     int actual_time = time(NULL);
 
 
-                    int bytes_written = write(client_sockfd, "+OK\r\n", strlen("+OK\r\n"));
-                    if (bytes_written == -1) {
-                        exit_with_error("Error writing to client");
+                    if(n->enter_time!= -1 && n->total_time != -1 && actual_time-n->enter_time>n->total_time){
+                        removeElement(t->list,key);
+                        int bytes_written = write(t->client_sockfd, "$-1\r\n", strlen("$-1\r\n"));
+                        if (bytes_written == -1) {
+                            exit_with_error("Error writing to client");
+                        }
                     }
+                    else{
+                        char response[256];
+                        sprintf(response,"$%ld\r\n%s\r\n", strlen(n->value), n->value);
+
+                        int bytes_written = write(t->client_sockfd, response, strlen(response));
+                        if (bytes_written == -1) {
+                            exit_with_error("Error writing to client");
+                        }
+                    }
+
+
+                    
                 }
+                if(sem_post(&semaphores)==-1)exit_with_error("error in sem_post during set"); 
                 free(key);    
             }
 
             //Connection
             if(strcmp(command, "CLIENT") == 0){
-                int bytes_written = write(client_sockfd, "+OK\r\n", strlen("+OK\r\n"));
+                int bytes_written = write(t->client_sockfd, "+OK\r\n", strlen("+OK\r\n"));
                 if (bytes_written == -1) {
                     exit_with_error("Error writing to client");
                 }
@@ -218,6 +246,9 @@ void reading_from_socket(int client_sockfd, struct LinkedList* list){
         
         
     }
+
+    free(t);
+    pthread_exit(EXIT_SUCCESS);
 }
 
 // https://redis.io/docs/reference/protocol-spec/
@@ -258,6 +289,10 @@ int main(int argc, const char * argv[]) {
         exit_with_error("Error listen on socket");
     }
 
+    if(sem_init(&semaphores, 1, 1) == -1) exit_with_error("Error initialization semaphore");
+
+
+
     while (1) {
         struct sockaddr_in client_addr;
         socklen_t client_addr_len = sizeof(client_addr);
@@ -267,31 +302,18 @@ int main(int argc, const char * argv[]) {
             exit_with_error("Error accept connection");
         }
 
-        pid_t pid = fork();
-        if (pid == -1) {
-            perror("Error create child process");
-            close(client_sockfd);
-        }
-        if (pid == 0) {
+       
 
-            close(sockfd);
+        struct Argouments* t = malloc(sizeof(struct Argouments));
+        t->list = list;
+        t->client_sockfd = client_sockfd;
 
-            reading_from_socket(client_sockfd, list);
-
-
-            close(client_sockfd);
-            exit(EXIT_SUCCESS);
-        }
-
-     
-        close(client_sockfd); 
-        memset(&client_addr, 0, sizeof(struct sockaddr_in));
-
-
+        pthread_t threads;
+        pthread_create(&threads, NULL, (void *)reading_from_socket, (void*)t);
+        
     }
 
     close(sockfd);
-
     freeLinkedList(list);
     free(list);
         
